@@ -81,6 +81,8 @@ function Ensure-Prerequisites {
 $script:GitHubHttpsRepoPattern = '^https?://github\.com/[^/]+/[^/]+(\.git)?$'
 $script:GitHubScpRepoPattern = '^git' + [regex]::Escape([string][char]64) + 'github\.com:[^/]+/[^/]+(\.git)?$'
 $script:GitHubSshRepoPattern = '^ssh://git' + [regex]::Escape([string][char]64) + 'github\.com/[^/]+/[^/]+(\.git)?$'
+$script:GitHubCredentialedHttpsRepoPattern = '^https?://[^/@]+(?::[^@]*)?' + [regex]::Escape([string][char]64) + 'github\.com/[^/]+/[^/]+(\.git)?/?$'
+$script:GitHubCredentialedHttpsSlugPattern = '^https?://[^/@]+(?::[^@]*)?' + [regex]::Escape([string][char]64) + 'github\.com/(?<slug>[^/]+/[^/]+?)(?<suffix>\.git)?/?$'
 
 function Test-IsGitHubRepoUrl {
     param([string]$Url)
@@ -96,6 +98,56 @@ function Test-SupportsTokenFallback {
     param([string]$Url)
 
     return (-not [string]::IsNullOrWhiteSpace($Url)) -and ($Url -match $script:GitHubHttpsRepoPattern)
+}
+
+function Get-SanitizedRepoUrl {
+    param([string]$Url)
+
+    if ([string]::IsNullOrWhiteSpace($Url)) {
+        return ''
+    }
+
+    return [regex]::Replace($Url.Trim(), '^(https?://)[^/@]+(?::[^@]*)?' + [regex]::Escape([string][char]64), '$1')
+}
+
+function Repair-OriginRemoteIfNeeded {
+    if (-not (Test-Path (Join-Path $TargetDir '.git'))) {
+        return
+    }
+
+    $originUrlOutput = & git -C $TargetDir remote get-url origin 2>$null
+    if ($LASTEXITCODE -ne 0 -or -not $originUrlOutput) {
+        return
+    }
+
+    $originUrl = ($originUrlOutput | Select-Object -First 1).ToString().Trim()
+    if ([string]::IsNullOrWhiteSpace($originUrl) -or -not ($originUrl -match $script:GitHubCredentialedHttpsRepoPattern)) {
+        return
+    }
+
+    $match = [regex]::Match($originUrl, $script:GitHubCredentialedHttpsSlugPattern)
+    if (-not $match.Success) {
+        return
+    }
+
+    $normalizedUrl = "https://github.com/$($match.Groups['slug'].Value)$($match.Groups['suffix'].Value)"
+    if ([string]::IsNullOrWhiteSpace($normalizedUrl) -or $normalizedUrl -eq $originUrl) {
+        return
+    }
+
+    & git -C $TargetDir remote set-url origin $normalizedUrl *> $null
+    if ($LASTEXITCODE -ne 0) {
+        Write-Warn '检测到历史凭证化 remote，但自动修复失败，将继续当前流程。'
+    }
+}
+
+function Test-RepoHasTrackedChanges {
+    $statusOutput = & git -C $TargetDir status --porcelain --untracked-files=no 2>$null
+    if ($LASTEXITCODE -ne 0) {
+        return $false
+    }
+
+    return -not [string]::IsNullOrWhiteSpace((($statusOutput | Out-String).Trim()))
 }
 
 function Ensure-GitHubAuth {
@@ -241,7 +293,7 @@ function Invoke-GitUpdateCore {
         return $false
     }
 
-    & git -C $TargetDir pull --ff-only origin $Branch | Out-Host
+    & git -C $TargetDir reset --hard "origin/$Branch" | Out-Host
     return ($LASTEXITCODE -eq 0)
 }
 
@@ -253,10 +305,23 @@ function Clone-Or-UpdateRepo {
 
     if (Test-Path (Join-Path $TargetDir '.git')) {
         Write-Info '检测到已有仓库，正在更新...'
+        Repair-OriginRemoteIfNeeded
         $originUrl = ''
         $originUrlOutput = & git -C $TargetDir remote get-url origin 2>$null
         if ($LASTEXITCODE -eq 0 -and $originUrlOutput) {
             $originUrl = ($originUrlOutput | Select-Object -First 1).ToString().Trim()
+        }
+
+        $didStash = $false
+        if (Test-RepoHasTrackedChanges) {
+            Write-Warn '检测到本地已跟踪文件有改动，自动暂存（git stash）后继续更新...'
+            & git -C $TargetDir stash push -m 'mdm-installer-auto-stash' --quiet | Out-Host
+            if ($LASTEXITCODE -eq 0) {
+                $didStash = $true
+            }
+            else {
+                throw '自动暂存本地修改失败，请手动执行 git stash 或提交改动后重试。'
+            }
         }
 
         $authReady = $false
@@ -264,17 +329,42 @@ function Clone-Or-UpdateRepo {
             $authReady = Ensure-GitHubAuth -Url $originUrl
         }
 
-        if (-not (Invoke-GitUpdateCore)) {
+        & git -C $TargetDir fetch --all --tags --prune | Out-Host
+        if ($LASTEXITCODE -ne 0) {
             if (Test-SupportsTokenFallback $originUrl) {
                 if ($authReady) {
-                    Write-Warn '使用 GitHub CLI 凭证更新失败，回退为 Token 输入方式重试...'
+                    Write-Warn '使用 GitHub CLI 方式执行 fetch 失败，可能是远端认证或网络问题，回退为 Token 输入方式重试...'
                 }
                 if (-not (Invoke-GitWithTokenAuth -Url $originUrl -Operation { Invoke-GitUpdateCore })) {
-                    throw '仓库更新失败，请检查仓库地址、分支或访问权限。'
+                    throw '仓库更新失败，请查看上方 git 原始错误；若提示分支不存在、无法快进或访问受限，请先处理后重试。'
                 }
             }
             else {
-                throw '仓库更新失败，请检查仓库地址、分支或访问权限。'
+                throw 'git fetch 失败，请查看上方 git 原始错误并检查远端访问权限。'
+            }
+            if ($didStash) {
+                & git -C $TargetDir stash pop --quiet | Out-Host
+                if ($LASTEXITCODE -ne 0) {
+                    Write-Warn '自动恢复暂存的本地修改失败，请手动执行 git stash pop 恢复。'
+                }
+            }
+            return
+        }
+
+        & git -C $TargetDir checkout $Branch | Out-Host
+        if ($LASTEXITCODE -ne 0) {
+            throw 'git checkout 失败，请检查目标分支是否存在，或先处理本地改动后重试。'
+        }
+
+        & git -C $TargetDir reset --hard "origin/$Branch" | Out-Host
+        if ($LASTEXITCODE -ne 0) {
+            throw 'git reset --hard 失败，请查看上方 git 原始错误。'
+        }
+
+        if ($didStash) {
+            & git -C $TargetDir stash pop --quiet | Out-Host
+            if ($LASTEXITCODE -ne 0) {
+                Write-Warn '自动恢复暂存的本地修改失败，请手动执行 git stash pop 恢复。'
             }
         }
         return
@@ -297,7 +387,7 @@ function Clone-Or-UpdateRepo {
     if (-not (Invoke-GitCloneCore -CloneUrl $RepoUrl)) {
         if (Test-SupportsTokenFallback $RepoUrl) {
             if ($authReady) {
-                Write-Warn '使用 GitHub CLI 凭证拉取失败，回退为 Token 输入方式重试...'
+                Write-Warn '使用 GitHub CLI 方式拉取失败，回退为 Token 输入方式重试...'
             }
             if (Test-Path $TargetDir) {
                 Remove-Item -Recurse -Force $TargetDir
@@ -310,6 +400,8 @@ function Clone-Or-UpdateRepo {
             throw '仓库克隆失败，请检查仓库地址、分支或访问权限。'
         }
     }
+
+    Repair-OriginRemoteIfNeeded
 }
 
 function Start-ProjectNow {
@@ -338,7 +430,7 @@ function Show-Summary {
     Write-Host '====================================='
     Write-Host 'MediaDownloadManager 一键安装完成'
     Write-Host '-------------------------------------'
-    Write-Host "仓库地址: $RepoUrl"
+    Write-Host ("仓库地址: " + (Get-SanitizedRepoUrl -Url $RepoUrl))
     Write-Host "安装目录: $TargetDir"
     Write-Host '立即启动: 已执行'
     Write-Host ("开机自启: " + ($(if ($SkipAutostart) { '已跳过' } else { '已配置（登录后自动启动）' })))

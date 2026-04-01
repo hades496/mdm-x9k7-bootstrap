@@ -215,6 +215,51 @@ supports_token_fallback() {
     printf '%s\n' "$1" | grep -Eq '^https?://github\.com/[^/]+/[^/]+(\.git)?$'
 }
 
+repo_has_tracked_changes() {
+    local status_output
+    status_output="$(run_as_target_shell "git -C '$TARGET_DIR' status --porcelain --untracked-files=no 2>/dev/null" || true)"
+    [ -n "$status_output" ]
+}
+
+sanitize_repo_url() {
+    local url="${1:-}"
+
+    if [ -z "$url" ]; then
+        printf '%s\n' ""
+        return 0
+    fi
+
+    printf '%s\n' "$url" | sed -E 's#^((https?)://)[^/@]+(:[^@]*)?@#\1#'
+}
+
+repair_origin_remote_if_needed() {
+    local origin_url normalized_url
+
+    if ! run_as_target_shell "[ -d '$TARGET_DIR/.git' ]"; then
+        return 0
+    fi
+
+    origin_url="$(run_as_target_shell "git -C '$TARGET_DIR' remote get-url origin 2>/dev/null || true")"
+    if [ -z "$origin_url" ]; then
+        return 0
+    fi
+
+    if ! printf '%s\n' "$origin_url" | grep -Eq '^https?://[^/@]+(:[^@]*)?@github\.com/[^/]+/[^/]+(\.git)?/?$'; then
+        return 0
+    fi
+
+    normalized_url="$(printf '%s\n' "$origin_url" | sed -E 's#^https?://[^/@]+(:[^@]*)?@github\.com/([^/]+/[^/]+)(\.git)?/?$#https://github.com/\2\3#')"
+    if [ -z "$normalized_url" ] || [ "$normalized_url" = "$origin_url" ]; then
+        return 0
+    fi
+
+    if ! run_as_target_shell "git -C '$TARGET_DIR' remote set-url origin '$normalized_url'"; then
+        warn "检测到历史凭证化 remote，但自动修复失败，将继续当前流程。"
+    fi
+
+    return 0
+}
+
 prepare_github_auth() {
     local repo_url="$1"
 
@@ -321,23 +366,52 @@ clone_or_update_repo() {
 
     if run_as_target_shell "[ -d '$TARGET_DIR/.git' ]"; then
         log "检测到已有仓库，正在更新..."
-        update_cmd="git -C '$TARGET_DIR' fetch --all --tags --prune && git -C '$TARGET_DIR' checkout '$BRANCH' && git -C '$TARGET_DIR' pull --ff-only origin '$BRANCH'"
+        repair_origin_remote_if_needed || true
         origin_url="$(run_as_target_shell "git -C '$TARGET_DIR' remote get-url origin 2>/dev/null || true")"
+
+        local did_stash=0
+        if repo_has_tracked_changes; then
+            warn "检测到本地已跟踪文件有改动，自动暂存（git stash）后继续更新..."
+            if run_as_target_shell "git -C '$TARGET_DIR' stash push -m 'mdm-installer-auto-stash' --quiet"; then
+                did_stash=1
+            else
+                fail "自动暂存本地修改失败，请手动执行 git stash 或提交改动后重试。"
+            fi
+        fi
+
         auth_ready=0
         if is_github_repo_url "$origin_url" && prepare_github_auth "$origin_url"; then
             auth_ready=1
         fi
 
-        if ! run_as_target_shell "$update_cmd"; then
+        update_cmd="git -C '$TARGET_DIR' fetch --all --tags --prune && git -C '$TARGET_DIR' checkout '$BRANCH' && git -C '$TARGET_DIR' reset --hard 'origin/$BRANCH'"
+
+        if ! run_as_target_shell "git -C '$TARGET_DIR' fetch --all --tags --prune"; then
             if supports_token_fallback "$origin_url"; then
                 if [ "$auth_ready" = "1" ]; then
-                    warn "使用 GitHub CLI 凭证更新失败，回退为 Token 输入方式重试..."
+                    warn "使用 GitHub CLI 方式执行 fetch 失败，可能是远端认证或网络问题，回退为 Token 输入方式重试..."
                 fi
-                run_git_with_token_auth "$origin_url" "$update_cmd" || fail "仓库更新失败，请检查仓库地址、分支或访问权限。"
-            else
-                fail "仓库更新失败，请检查仓库地址、分支或访问权限。"
+                run_git_with_token_auth "$origin_url" "$update_cmd" || fail "仓库更新失败，请查看上方 git 原始错误；若提示分支不存在、无法快进或访问受限，请先处理后重试。"
+                if [ "$did_stash" = "1" ]; then
+                    run_as_target_shell "git -C '$TARGET_DIR' stash pop --quiet" || warn "自动恢复暂存的本地修改失败，请手动执行 git stash pop 恢复。"
+                fi
+                return 0
             fi
+            fail "git fetch 失败，请查看上方 git 原始错误并检查远端访问权限。"
         fi
+
+        if ! run_as_target_shell "git -C '$TARGET_DIR' checkout '$BRANCH'"; then
+            fail "git checkout 失败，请检查目标分支是否存在，或先处理本地改动后重试。"
+        fi
+
+        if ! run_as_target_shell "git -C '$TARGET_DIR' reset --hard 'origin/$BRANCH'"; then
+            fail "git reset --hard 失败，请查看上方 git 原始错误。"
+        fi
+
+        if [ "$did_stash" = "1" ]; then
+            run_as_target_shell "git -C '$TARGET_DIR' stash pop --quiet" || warn "自动恢复暂存的本地修改失败，请手动执行 git stash pop 恢复。"
+        fi
+
         return 0
     fi
 
@@ -354,7 +428,7 @@ clone_or_update_repo() {
     if ! run_as_target_shell "rm -rf '$TARGET_DIR' && git clone --branch '$BRANCH' '$REPO_URL' '$TARGET_DIR'"; then
         if supports_token_fallback "$REPO_URL"; then
             if [ "$auth_ready" = "1" ]; then
-                warn "使用 GitHub CLI 凭证拉取失败，回退为 Token 输入方式重试..."
+                warn "使用 GitHub CLI 方式拉取失败，回退为 Token 输入方式重试..."
             fi
             run_git_with_token_auth "$REPO_URL" "rm -rf '$TARGET_DIR' && git clone --branch '$BRANCH' '$REPO_URL' '$TARGET_DIR'" || fail "仓库克隆失败，请检查仓库地址、分支或访问权限。"
         else
@@ -409,12 +483,9 @@ EOF
 
     if command_exists launchctl; then
         run_as_target_shell "launchctl unload '$plist_path' >/dev/null 2>&1 || true"
-        if ! run_as_target_shell "launchctl load '$plist_path'"; then
-            warn "launchctl 立即加载失败，但自启动配置文件已写入，后续登录系统时仍可生效。"
-        fi
     fi
 
-    log "已写入 macOS 自启动配置: $plist_path"
+    log "已写入 macOS 自启动配置: $plist_path（将在下次登录时自动启动）"
 }
 
 configure_linux_autostart() {
@@ -447,8 +518,7 @@ WantedBy=multi-user.target
 EOF
         run_root systemctl daemon-reload
         run_root systemctl enable mediadownloadmanager.service
-        run_root systemctl restart mediadownloadmanager.service
-        log "已启用 Linux systemd 开机自启服务。"
+        log "已启用 Linux systemd 开机自启服务（将在下次开机时自动启动）。"
         return 0
     fi
 
@@ -465,7 +535,7 @@ summarize() {
 =====================================
 MediaDownloadManager 一键安装完成
 -------------------------------------
-仓库地址: ${REPO_URL}
+仓库地址: $(sanitize_repo_url "${REPO_URL}")
 安装目录: ${TARGET_DIR}
 立即启动: 已执行
 开机自启: $( [ "$SKIP_AUTOSTART" = "1" ] && echo "已跳过" || echo "已配置" )
