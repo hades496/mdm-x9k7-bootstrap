@@ -2,7 +2,8 @@ param(
     [string]$RepoUrl = $(if ($env:MDM_REPO_URL) { $env:MDM_REPO_URL } else { 'https://github.com/hades496/MediaDownloadManager.git' }),
     [string]$Branch = $(if ($env:MDM_BRANCH) { $env:MDM_BRANCH } else { 'main' }),
     [string]$TargetDir = $(if ($env:MDM_INSTALL_DIR) { $env:MDM_INSTALL_DIR } else { Join-Path $HOME 'MediaDownloadManager' }),
-    [switch]$SkipAutostart
+    [switch]$SkipAutostart,
+    [bool]$ForceReset = $(if ([string]::IsNullOrWhiteSpace($env:MDM_FORCE_RESET)) { $false } elseif ($env:MDM_FORCE_RESET -match '^(?i:1|true|yes|on)$') { $true } else { $false })
 )
 
 $ErrorActionPreference = 'Stop'
@@ -148,6 +149,36 @@ function Test-RepoHasTrackedChanges {
     }
 
     return -not [string]::IsNullOrWhiteSpace((($statusOutput | Out-String).Trim()))
+}
+
+function Test-RepoHasUnmergedPaths {
+    $unmergedOutput = & git -C $TargetDir diff --name-only --diff-filter=U 2>$null
+    if ($LASTEXITCODE -ne 0) {
+        return $false
+    }
+
+    return -not [string]::IsNullOrWhiteSpace((($unmergedOutput | Out-String).Trim()))
+}
+
+function Repair-UnmergedStateIfNeeded {
+    if (-not (Test-RepoHasUnmergedPaths)) {
+        return
+    }
+
+    Write-Warn '检测到仓库存在未完成合并，正在自动清理冲突状态后继续更新...'
+
+    & git -C $TargetDir merge --abort *> $null
+    & git -C $TargetDir rebase --abort *> $null
+    & git -C $TargetDir cherry-pick --abort *> $null
+
+    & git -C $TargetDir reset --hard HEAD | Out-Host
+    if ($LASTEXITCODE -ne 0) {
+        throw '检测到未完成合并且自动清理失败，请先手动处理冲突后重试。'
+    }
+
+    if (Test-RepoHasUnmergedPaths) {
+        throw '检测到未完成合并且无法自动恢复，请先手动处理冲突后重试。'
+    }
 }
 
 function Ensure-GitHubAuth {
@@ -306,6 +337,7 @@ function Clone-Or-UpdateRepo {
     if (Test-Path (Join-Path $TargetDir '.git')) {
         Write-Info '检测到已有仓库，正在更新...'
         Repair-OriginRemoteIfNeeded
+        Repair-UnmergedStateIfNeeded
         $originUrl = ''
         $originUrlOutput = & git -C $TargetDir remote get-url origin 2>$null
         if ($LASTEXITCODE -eq 0 -and $originUrlOutput) {
@@ -313,7 +345,18 @@ function Clone-Or-UpdateRepo {
         }
 
         $didStash = $false
-        if (Test-RepoHasTrackedChanges) {
+        if ($ForceReset) {
+            Write-Warn '已启用强制覆盖更新：将丢弃本地未提交改动与未跟踪文件。'
+            & git -C $TargetDir reset --hard HEAD | Out-Host
+            if ($LASTEXITCODE -ne 0) {
+                throw '强制覆盖前清理本地改动失败。'
+            }
+            & git -C $TargetDir clean -fd | Out-Host
+            if ($LASTEXITCODE -ne 0) {
+                throw '强制覆盖前清理未跟踪文件失败。'
+            }
+        }
+        elseif (Test-RepoHasTrackedChanges) {
             Write-Warn '检测到本地已跟踪文件有改动，自动暂存（git stash）后继续更新...'
             & git -C $TargetDir stash push -m 'mdm-installer-auto-stash' --quiet | Out-Host
             if ($LASTEXITCODE -eq 0) {

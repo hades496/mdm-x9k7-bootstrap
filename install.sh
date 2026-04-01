@@ -5,6 +5,7 @@ REPO_URL_DEFAULT="https://github.com/hades496/MediaDownloadManager.git"
 REPO_URL="${MDM_REPO_URL:-$REPO_URL_DEFAULT}"
 BRANCH="${MDM_BRANCH:-main}"
 SKIP_AUTOSTART="${MDM_SKIP_AUTOSTART:-0}"
+FORCE_RESET="${MDM_FORCE_RESET:-0}"
 TARGET_USER="${SUDO_USER:-$(id -un)}"
 TARGET_HOME="$(eval echo "~${TARGET_USER}")"
 TARGET_DIR_DEFAULT="${TARGET_HOME}/MediaDownloadManager"
@@ -74,6 +75,10 @@ parse_args() {
                 ;;
             --skip-autostart)
                 SKIP_AUTOSTART=1
+                shift
+                ;;
+            --force-reset)
+                FORCE_RESET=1
                 shift
                 ;;
             *)
@@ -219,6 +224,32 @@ repo_has_tracked_changes() {
     local status_output
     status_output="$(run_as_target_shell "git -C '$TARGET_DIR' status --porcelain --untracked-files=no 2>/dev/null" || true)"
     [ -n "$status_output" ]
+}
+
+repo_has_unmerged_paths() {
+    local unmerged_output
+    unmerged_output="$(run_as_target_shell "git -C '$TARGET_DIR' diff --name-only --diff-filter=U 2>/dev/null" || true)"
+    [ -n "$unmerged_output" ]
+}
+
+cleanup_unmerged_state_if_needed() {
+    if ! repo_has_unmerged_paths; then
+        return 0
+    fi
+
+    warn "检测到仓库存在未完成合并，正在自动清理冲突状态后继续更新..."
+
+    run_as_target_shell "git -C '$TARGET_DIR' merge --abort >/dev/null 2>&1 || true"
+    run_as_target_shell "git -C '$TARGET_DIR' rebase --abort >/dev/null 2>&1 || true"
+    run_as_target_shell "git -C '$TARGET_DIR' cherry-pick --abort >/dev/null 2>&1 || true"
+
+    if ! run_as_target_shell "git -C '$TARGET_DIR' reset --hard HEAD"; then
+        fail "检测到未完成合并且自动清理失败，请先手动处理冲突后重试。"
+    fi
+
+    if repo_has_unmerged_paths; then
+        fail "检测到未完成合并且无法自动恢复，请先手动处理冲突后重试。"
+    fi
 }
 
 sanitize_repo_url() {
@@ -367,10 +398,15 @@ clone_or_update_repo() {
     if run_as_target_shell "[ -d '$TARGET_DIR/.git' ]"; then
         log "检测到已有仓库，正在更新..."
         repair_origin_remote_if_needed || true
+        cleanup_unmerged_state_if_needed
         origin_url="$(run_as_target_shell "git -C '$TARGET_DIR' remote get-url origin 2>/dev/null || true")"
 
         local did_stash=0
-        if repo_has_tracked_changes; then
+        if [ "$FORCE_RESET" = "1" ]; then
+            warn "已启用强制覆盖更新：将丢弃本地未提交改动与未跟踪文件。"
+            run_as_target_shell "git -C '$TARGET_DIR' reset --hard HEAD" || fail "强制覆盖前清理本地改动失败。"
+            run_as_target_shell "git -C '$TARGET_DIR' clean -fd" || fail "强制覆盖前清理未跟踪文件失败。"
+        elif repo_has_tracked_changes; then
             warn "检测到本地已跟踪文件有改动，自动暂存（git stash）后继续更新..."
             if run_as_target_shell "git -C '$TARGET_DIR' stash push -m 'mdm-installer-auto-stash' --quiet"; then
                 did_stash=1
