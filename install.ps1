@@ -11,6 +11,10 @@ function Write-Info($Message) {
     Write-Host "[MDM installer] $Message"
 }
 
+function Write-Warn($Message) {
+    Write-Host "[MDM installer] WARN: $Message"
+}
+
 function Refresh-Path {
     $machinePath = [Environment]::GetEnvironmentVariable('Path', 'Machine')
     $userPath = [Environment]::GetEnvironmentVariable('Path', 'User')
@@ -18,6 +22,15 @@ function Refresh-Path {
     if ($machinePath) { $paths += $machinePath }
     if ($userPath) { $paths += $userPath }
     $env:Path = $paths -join ';'
+}
+
+function Test-IsInteractiveSession {
+    try {
+        return [Environment]::UserInteractive -and -not [Console]::IsInputRedirected
+    }
+    catch {
+        return $true
+    }
 }
 
 function Ensure-Winget {
@@ -53,31 +66,183 @@ function Ensure-Prerequisites {
         Install-WingetPackage -Id 'Gyan.FFmpeg' -DisplayName 'FFmpeg'
         Refresh-Path
     }
+
+    if (-not (Get-Command gh.exe -ErrorAction SilentlyContinue)) {
+        try {
+            Install-WingetPackage -Id 'GitHub.cli' -DisplayName 'GitHub CLI'
+            Refresh-Path
+        }
+        catch {
+            Write-Warn 'GitHub CLI 安装失败，将在认证阶段回退为 Token 输入方式。'
+        }
+    }
+}
+
+$script:GitHubHttpsRepoPattern = '^https?://github\.com/[^/]+/[^/]+(\.git)?$'
+$script:GitHubScpRepoPattern = '^git' + [regex]::Escape([string][char]64) + 'github\.com:[^/]+/[^/]+(\.git)?$'
+$script:GitHubSshRepoPattern = '^ssh://git' + [regex]::Escape([string][char]64) + 'github\.com/[^/]+/[^/]+(\.git)?$'
+
+function Test-IsGitHubRepoUrl {
+    param([string]$Url)
+
+    return (-not [string]::IsNullOrWhiteSpace($Url)) -and (
+        ($Url -match $script:GitHubHttpsRepoPattern) -or
+        ($Url -match $script:GitHubScpRepoPattern) -or
+        ($Url -match $script:GitHubSshRepoPattern)
+    )
+}
+
+function Test-SupportsTokenFallback {
+    param([string]$Url)
+
+    return (-not [string]::IsNullOrWhiteSpace($Url)) -and ($Url -match $script:GitHubHttpsRepoPattern)
+}
+
+function Ensure-GitHubAuth {
+    param([Parameter(Mandatory = $true)][string]$Url)
+
+    if (-not (Test-IsGitHubRepoUrl $Url)) {
+        return $false
+    }
+
+    if (-not (Get-Command gh.exe -ErrorAction SilentlyContinue)) {
+        Write-Warn '未检测到 GitHub CLI，将在必要时回退为 Token 输入方式。'
+        return $false
+    }
+
+    & gh.exe auth status *> $null
+    if ($LASTEXITCODE -eq 0) {
+        Write-Info '检测到 GitHub CLI 已登录，正在复用 gh 凭证...'
+    }
+    else {
+        if (-not (Test-IsInteractiveSession)) {
+            Write-Warn '当前无交互终端，将在必要时回退为 Token 输入方式。'
+            return $false
+        }
+
+        Write-Info '检测到 GitHub 仓库，优先使用 GitHub CLI 登录...'
+        & gh.exe auth login
+        if ($LASTEXITCODE -ne 0) {
+            Write-Warn 'GitHub CLI 登录未完成，将在必要时回退为 Token 输入方式。'
+            return $false
+        }
+    }
+
+    & gh.exe auth setup-git *> $null
+    if ($LASTEXITCODE -ne 0) {
+        Write-Warn 'gh auth setup-git 执行失败，将在必要时回退为 Token 输入方式。'
+        return $false
+    }
+
+    return $true
 }
 
 function Get-GitHubToken {
-    # 检查仓库是否是私有仓库（URL包含github.com且没有token）
-    if ($RepoUrl -like '*github.com*' -and $RepoUrl -notlike '*@github.com*') {
-        Write-Info "检测到GitHub私有仓库，需要Personal Access Token进行访问。"
-        Write-Info ""
-        Write-Info "获取Token步骤："
-        Write-Info "1. 访问 https://github.com/settings/tokens"
-        Write-Info "2. 点击 'Generate new token' → 'Generate new token (classic)'"
-        Write-Info "3. 选择 'repo' 权限（访问私有仓库）"
-        Write-Info "4. 点击 'Generate token' 并复制"
-        Write-Info ""
-        
-        $script:GitHubToken = Read-Host -Prompt "请输入你的GitHub Personal Access Token" -AsSecureString
-        $tokenPlain = [System.Runtime.InteropServices.Marshal]::PtrToStringAuto([System.Runtime.InteropServices.Marshal]::SecureStringToBSTR($GitHubToken))
-        
-        if ([string]::IsNullOrWhiteSpace($tokenPlain)) {
-            throw "Token不能为空，请重新运行并输入有效的GitHub Token。"
-        }
-        
-        # 将token嵌入到URL中
-        $script:RepoUrl = $RepoUrl -replace 'github.com', "$tokenPlain@github.com"
-        Write-Info "已配置私有仓库访问，正在克隆..."
+    param([Parameter(Mandatory = $true)][string]$Url)
+
+    if ($script:GitHubTokenPlain) {
+        return $script:GitHubTokenPlain
     }
+
+    if ($env:GITHUB_TOKEN) {
+        $script:GitHubTokenPlain = $env:GITHUB_TOKEN
+        return $script:GitHubTokenPlain
+    }
+
+    if (-not (Test-SupportsTokenFallback $Url)) {
+        throw '当前仓库地址不支持 Token 回退，请改用 GitHub CLI 或提供可访问的 GitHub HTTPS 仓库地址。'
+    }
+
+    Write-Info 'GitHub CLI 认证不可用，回退为 Personal Access Token 访问。'
+    Write-Info ''
+    Write-Info '获取 Token 步骤：'
+    Write-Info "1. 访问 https://github.com/settings/tokens"
+    Write-Info "2. 点击 'Generate new token' → 'Generate new token (classic)'"
+    Write-Info "3. 选择 'repo' 权限（访问私有仓库）"
+    Write-Info "4. 点击 'Generate token' 并复制"
+    Write-Info ''
+
+    if (-not (Test-IsInteractiveSession)) {
+        throw '当前环境没有交互终端，无法手动输入 Token；请先设置 GITHUB_TOKEN 环境变量后重试。'
+    }
+
+    $secureToken = Read-Host -Prompt '请输入你的GitHub Personal Access Token' -AsSecureString
+    $tokenBstr = [System.Runtime.InteropServices.Marshal]::SecureStringToBSTR($secureToken)
+    try {
+        $tokenPlain = [System.Runtime.InteropServices.Marshal]::PtrToStringAuto($tokenBstr)
+    }
+    finally {
+        [System.Runtime.InteropServices.Marshal]::ZeroFreeBSTR($tokenBstr)
+    }
+
+    if ([string]::IsNullOrWhiteSpace($tokenPlain)) {
+        throw 'Token不能为空，请重新运行并输入有效的GitHub Token。'
+    }
+
+    $script:GitHubTokenPlain = $tokenPlain
+    $env:GITHUB_TOKEN = $tokenPlain
+    return $script:GitHubTokenPlain
+}
+
+function New-GitAskPassScript {
+    $askPassPath = Join-Path ([System.IO.Path]::GetTempPath()) ("mdm-git-askpass-" + [Guid]::NewGuid().ToString('N') + '.cmd')
+    $content = @'
+@echo off
+setlocal
+set "PROMPT_TEXT=%*"
+echo %PROMPT_TEXT% | findstr /I "Username" >nul
+if not errorlevel 1 (
+    echo git
+) else (
+    echo %GITHUB_TOKEN%
+)
+'@
+    Set-Content -Path $askPassPath -Value $content -Encoding Ascii
+    return $askPassPath
+}
+
+function Invoke-GitWithTokenAuth {
+    param(
+        [Parameter(Mandatory = $true)][string]$Url,
+        [Parameter(Mandatory = $true)][scriptblock]$Operation
+    )
+
+    $null = Get-GitHubToken -Url $Url
+    $askPassPath = New-GitAskPassScript
+    try {
+        $env:GIT_TERMINAL_PROMPT = '0'
+        $env:GIT_ASKPASS = $askPassPath
+        return (& $Operation)
+    }
+    finally {
+        Remove-Item -Path $askPassPath -Force -ErrorAction SilentlyContinue
+        Remove-Item Env:GIT_ASKPASS -ErrorAction SilentlyContinue
+        Remove-Item Env:GIT_TERMINAL_PROMPT -ErrorAction SilentlyContinue
+        Remove-Item Env:GITHUB_TOKEN -ErrorAction SilentlyContinue
+        $script:GitHubTokenPlain = $null
+    }
+}
+
+function Invoke-GitCloneCore {
+    param([Parameter(Mandatory = $true)][string]$CloneUrl)
+
+    & git clone --branch $Branch $CloneUrl $TargetDir | Out-Host
+    return ($LASTEXITCODE -eq 0)
+}
+
+function Invoke-GitUpdateCore {
+    & git -C $TargetDir fetch --all --tags --prune | Out-Host
+    if ($LASTEXITCODE -ne 0) {
+        return $false
+    }
+
+    & git -C $TargetDir checkout $Branch | Out-Host
+    if ($LASTEXITCODE -ne 0) {
+        return $false
+    }
+
+    & git -C $TargetDir pull --ff-only origin $Branch | Out-Host
+    return ($LASTEXITCODE -eq 0)
 }
 
 function Clone-Or-UpdateRepo {
@@ -88,9 +253,30 @@ function Clone-Or-UpdateRepo {
 
     if (Test-Path (Join-Path $TargetDir '.git')) {
         Write-Info '检测到已有仓库，正在更新...'
-        git -C $TargetDir fetch --all --tags --prune | Out-Host
-        git -C $TargetDir checkout $Branch | Out-Host
-        git -C $TargetDir pull --ff-only origin $Branch | Out-Host
+        $originUrl = ''
+        $originUrlOutput = & git -C $TargetDir remote get-url origin 2>$null
+        if ($LASTEXITCODE -eq 0 -and $originUrlOutput) {
+            $originUrl = ($originUrlOutput | Select-Object -First 1).ToString().Trim()
+        }
+
+        $authReady = $false
+        if (Test-IsGitHubRepoUrl $originUrl) {
+            $authReady = Ensure-GitHubAuth -Url $originUrl
+        }
+
+        if (-not (Invoke-GitUpdateCore)) {
+            if (Test-SupportsTokenFallback $originUrl) {
+                if ($authReady) {
+                    Write-Warn '使用 GitHub CLI 凭证更新失败，回退为 Token 输入方式重试...'
+                }
+                if (-not (Invoke-GitWithTokenAuth -Url $originUrl -Operation { Invoke-GitUpdateCore })) {
+                    throw '仓库更新失败，请检查仓库地址、分支或访问权限。'
+                }
+            }
+            else {
+                throw '仓库更新失败，请检查仓库地址、分支或访问权限。'
+            }
+        }
         return
     }
 
@@ -102,11 +288,28 @@ function Clone-Or-UpdateRepo {
         Remove-Item -Recurse -Force $TargetDir
     }
 
-    # 提示输入GitHub Token（如果是私有仓库）
-    Get-GitHubToken
+    $authReady = $false
+    if (Test-IsGitHubRepoUrl $RepoUrl) {
+        $authReady = Ensure-GitHubAuth -Url $RepoUrl
+    }
 
     Write-Info "正在克隆项目到 $TargetDir ..."
-    git clone --branch $Branch $RepoUrl $TargetDir | Out-Host
+    if (-not (Invoke-GitCloneCore -CloneUrl $RepoUrl)) {
+        if (Test-SupportsTokenFallback $RepoUrl) {
+            if ($authReady) {
+                Write-Warn '使用 GitHub CLI 凭证拉取失败，回退为 Token 输入方式重试...'
+            }
+            if (Test-Path $TargetDir) {
+                Remove-Item -Recurse -Force $TargetDir
+            }
+            if (-not (Invoke-GitWithTokenAuth -Url $RepoUrl -Operation { Invoke-GitCloneCore -CloneUrl $RepoUrl })) {
+                throw '仓库克隆失败，请检查仓库地址、分支或访问权限。'
+            }
+        }
+        else {
+            throw '仓库克隆失败，请检查仓库地址、分支或访问权限。'
+        }
+    }
 }
 
 function Start-ProjectNow {

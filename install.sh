@@ -44,14 +44,14 @@ run_as_target_shell() {
         bash -lc "$wrapped"
     elif [ "${EUID}" -eq 0 ]; then
         if command_exists sudo; then
-            sudo -H -u "$TARGET_USER" bash -lc "$wrapped"
+            sudo --preserve-env=GITHUB_TOKEN -H -u "$TARGET_USER" bash -lc "$wrapped"
         elif command_exists su; then
-            su - "$TARGET_USER" -c "$wrapped"
+            su -m "$TARGET_USER" -c "$wrapped"
         else
             fail "当前操作需要切换到用户 ${TARGET_USER} 执行，但系统中既没有 sudo 也没有 su。"
         fi
     elif command_exists sudo; then
-        sudo -H -u "$TARGET_USER" bash -lc "$wrapped"
+        sudo --preserve-env=GITHUB_TOKEN -H -u "$TARGET_USER" bash -lc "$wrapped"
     else
         fail "当前操作需要切换到用户 ${TARGET_USER} 执行，但系统中没有 sudo。"
     fi
@@ -145,39 +145,199 @@ install_linux_dependencies() {
     fail "未识别的 Linux 发行版包管理器，请手动安装 git / curl / python3 / ffmpeg 后再执行。"
 }
 
-prompt_github_token() {
-    # 检查仓库是否是私有仓库（URL包含github.com且没有token）
-    if [[ "$REPO_URL" == *"github.com"* && "$REPO_URL" != *"@github.com"* ]]; then
-        log "检测到GitHub私有仓库，需要Personal Access Token进行访问。"
-        log ""
-        log "获取Token步骤："
-        log "1. 访问 https://github.com/settings/tokens"
-        log "2. 点击 'Generate new token' → 'Generate new token (classic)'"
-        log "3. 选择 'repo' 权限（访问私有仓库）"
-        log "4. 点击 'Generate token' 并复制"
-        log ""
-        
-        read -p "请输入你的GitHub Personal Access Token: " -s GITHUB_TOKEN
-        echo ""
-        
-        if [ -z "$GITHUB_TOKEN" ]; then
-            fail "Token不能为空，请重新运行并输入有效的GitHub Token。"
+has_interactive_tty() {
+    exec 3<>/dev/tty >/dev/null 2>&1 || return 1
+    exec 3>&-
+    exec 3<&-
+    return 0
+}
+
+run_as_target_shell_interactive() {
+    local cmd="$1"
+    local wrapped="export HOME='${TARGET_HOME}'; export PATH='/opt/homebrew/bin:/usr/local/bin:$PATH'; ${cmd}"
+
+    if ! has_interactive_tty; then
+        warn "当前无交互终端，将在必要时回退为 Token 输入方式。"
+        return 1
+    fi
+
+    if [ "$(id -un)" = "$TARGET_USER" ]; then
+        bash -lc "$wrapped" </dev/tty >/dev/tty 2>/dev/tty
+    elif [ "${EUID}" -eq 0 ]; then
+        if command_exists sudo; then
+            sudo --preserve-env=GITHUB_TOKEN -H -u "$TARGET_USER" bash -lc "$wrapped" </dev/tty >/dev/tty 2>/dev/tty
+        elif command_exists su; then
+            su -m "$TARGET_USER" -c "$wrapped" </dev/tty >/dev/tty 2>/dev/tty
+        else
+            fail "当前操作需要切换到用户 ${TARGET_USER} 执行，但系统中既没有 sudo 也没有 su。"
         fi
-        
-        # 将token嵌入到URL中
-        REPO_URL="${REPO_URL/github.com/${GITHUB_TOKEN}@github.com}"
-        log "已配置私有仓库访问，正在克隆..."
+    elif command_exists sudo; then
+        sudo --preserve-env=GITHUB_TOKEN -H -u "$TARGET_USER" bash -lc "$wrapped" </dev/tty >/dev/tty 2>/dev/tty
+    else
+        fail "当前操作需要切换到用户 ${TARGET_USER} 执行，但系统中没有 sudo。"
     fi
 }
 
+try_install_github_cli() {
+    if run_as_target_shell "command -v gh >/dev/null 2>&1"; then
+        return 0
+    fi
+
+    case "$(uname -s)" in
+        Darwin)
+            log "尝试通过 Homebrew 安装 GitHub CLI (gh) ..."
+            run_as_target_shell "brew install gh" || warn "GitHub CLI 安装失败，将在认证阶段回退为 Token 输入方式。"
+            ;;
+        Linux)
+            log "尝试安装 GitHub CLI (gh) ..."
+            if command_exists apt-get; then
+                run_root env DEBIAN_FRONTEND=noninteractive apt-get install -y gh || warn "GitHub CLI 安装失败，将在认证阶段回退为 Token 输入方式。"
+            elif command_exists dnf; then
+                run_root dnf install -y gh || warn "GitHub CLI 安装失败，将在认证阶段回退为 Token 输入方式。"
+            elif command_exists yum; then
+                run_root yum install -y gh || warn "GitHub CLI 安装失败，将在认证阶段回退为 Token 输入方式。"
+            elif command_exists pacman; then
+                run_root pacman -Sy --noconfirm gh || warn "GitHub CLI 安装失败，将在认证阶段回退为 Token 输入方式。"
+            elif command_exists zypper; then
+                run_root zypper --non-interactive install gh || warn "GitHub CLI 安装失败，将在认证阶段回退为 Token 输入方式。"
+            else
+                warn "当前 Linux 包管理器不支持自动安装 GitHub CLI，将在认证阶段回退为 Token 输入方式。"
+            fi
+            ;;
+    esac
+}
+
+is_github_repo_url() {
+    printf '%s\n' "$1" | grep -Eq '^(https?://github\.com/[^/]+/[^/]+(\.git)?|git@github\.com:[^/]+/[^/]+(\.git)?|ssh://git@github\.com/[^/]+/[^/]+(\.git)?)$'
+}
+
+supports_token_fallback() {
+    printf '%s\n' "$1" | grep -Eq '^https?://github\.com/[^/]+/[^/]+(\.git)?$'
+}
+
+prepare_github_auth() {
+    local repo_url="$1"
+
+    if ! is_github_repo_url "$repo_url"; then
+        return 1
+    fi
+
+    if ! run_as_target_shell "command -v gh >/dev/null 2>&1"; then
+        warn "未检测到 GitHub CLI，将在必要时回退为 Token 输入方式。"
+        return 1
+    fi
+
+    if run_as_target_shell "gh auth status >/dev/null 2>&1"; then
+        log "检测到 GitHub CLI 已登录，正在复用 gh 凭证..."
+    else
+        log "检测到 GitHub 仓库，优先使用 GitHub CLI 登录..."
+        if ! run_as_target_shell_interactive "gh auth login"; then
+            warn "GitHub CLI 登录未完成，将在必要时回退为 Token 输入方式。"
+            return 1
+        fi
+    fi
+
+    if ! run_as_target_shell "gh auth setup-git >/dev/null 2>&1"; then
+        warn "gh auth setup-git 执行失败，将在必要时回退为 Token 输入方式。"
+        return 1
+    fi
+
+    return 0
+}
+
+prompt_github_token() {
+    local repo_url="$1"
+
+    if [ -n "${GITHUB_TOKEN:-}" ]; then
+        export GITHUB_TOKEN
+        return 0
+    fi
+
+    supports_token_fallback "$repo_url" || fail "当前仓库地址不支持 Token 回退，请改用 GitHub CLI 或提供可访问的 GitHub HTTPS 仓库地址。"
+
+    log "GitHub CLI 认证不可用，回退为 Personal Access Token 访问。"
+    log ""
+    log "获取 Token 步骤："
+    log "1. 访问 https://github.com/settings/tokens"
+    log "2. 点击 'Generate new token' → 'Generate new token (classic)'"
+    log "3. 选择 'repo' 权限（访问私有仓库）"
+    log "4. 点击 'Generate token' 并复制"
+    log ""
+
+    has_interactive_tty || fail "当前环境没有交互终端，无法手动输入 Token；请先设置 GITHUB_TOKEN 环境变量后重试。"
+
+    read -r -p "请输入你的GitHub Personal Access Token: " -s GITHUB_TOKEN </dev/tty
+    echo "" >/dev/tty
+
+    if [ -z "$GITHUB_TOKEN" ]; then
+        fail "Token不能为空，请重新运行并输入有效的GitHub Token。"
+    fi
+
+    export GITHUB_TOKEN
+}
+
+create_git_askpass_script() {
+    local script_path
+
+    script_path="$(mktemp "${TMPDIR:-/tmp}/mdm-git-askpass.XXXXXX")" || fail "无法创建临时 Git 凭证脚本。"
+    cat <<'EOF' >"$script_path"
+#!/bin/sh
+case "$1" in
+    *Username*|*username*)
+        printf '%s\n' "${GITHUB_USERNAME:-git}"
+        ;;
+    *)
+        printf '%s\n' "${GITHUB_TOKEN:-}"
+        ;;
+esac
+EOF
+    chmod 755 "$script_path"
+    printf '%s\n' "$script_path"
+}
+
+run_git_with_token_auth() {
+    local repo_url="$1"
+    local git_cmd="$2"
+    local askpass_script status
+
+    prompt_github_token "$repo_url"
+    askpass_script="$(create_git_askpass_script)"
+
+    if run_as_target_shell "export GIT_TERMINAL_PROMPT=0; export GIT_ASKPASS='$askpass_script'; ${git_cmd}"; then
+        status=0
+    else
+        status=$?
+    fi
+
+    rm -f "$askpass_script" || true
+    unset GITHUB_TOKEN || true
+    return "$status"
+}
+
 clone_or_update_repo() {
-    local parent_dir
+    local parent_dir update_cmd origin_url auth_ready
     parent_dir="$(dirname "$TARGET_DIR")"
     run_as_target_shell "mkdir -p '$parent_dir'"
 
     if run_as_target_shell "[ -d '$TARGET_DIR/.git' ]"; then
         log "检测到已有仓库，正在更新..."
-        run_as_target_shell "git -C '$TARGET_DIR' fetch --all --tags --prune && git -C '$TARGET_DIR' checkout '$BRANCH' && git -C '$TARGET_DIR' pull --ff-only origin '$BRANCH'"
+        update_cmd="git -C '$TARGET_DIR' fetch --all --tags --prune && git -C '$TARGET_DIR' checkout '$BRANCH' && git -C '$TARGET_DIR' pull --ff-only origin '$BRANCH'"
+        origin_url="$(run_as_target_shell "git -C '$TARGET_DIR' remote get-url origin 2>/dev/null || true")"
+        auth_ready=0
+        if is_github_repo_url "$origin_url" && prepare_github_auth "$origin_url"; then
+            auth_ready=1
+        fi
+
+        if ! run_as_target_shell "$update_cmd"; then
+            if supports_token_fallback "$origin_url"; then
+                if [ "$auth_ready" = "1" ]; then
+                    warn "使用 GitHub CLI 凭证更新失败，回退为 Token 输入方式重试..."
+                fi
+                run_git_with_token_auth "$origin_url" "$update_cmd" || fail "仓库更新失败，请检查仓库地址、分支或访问权限。"
+            else
+                fail "仓库更新失败，请检查仓库地址、分支或访问权限。"
+            fi
+        fi
         return 0
     fi
 
@@ -185,11 +345,22 @@ clone_or_update_repo() {
         fail "目标目录 '$TARGET_DIR' 已存在且非空，无法自动 clone。"
     fi
 
-    # 提示输入GitHub Token（如果是私有仓库）
-    prompt_github_token
+    auth_ready=0
+    if is_github_repo_url "$REPO_URL" && prepare_github_auth "$REPO_URL"; then
+        auth_ready=1
+    fi
 
     log "正在克隆项目到 $TARGET_DIR ..."
-    run_as_target_shell "rm -rf '$TARGET_DIR' && git clone --branch '$BRANCH' '$REPO_URL' '$TARGET_DIR'"
+    if ! run_as_target_shell "rm -rf '$TARGET_DIR' && git clone --branch '$BRANCH' '$REPO_URL' '$TARGET_DIR'"; then
+        if supports_token_fallback "$REPO_URL"; then
+            if [ "$auth_ready" = "1" ]; then
+                warn "使用 GitHub CLI 凭证拉取失败，回退为 Token 输入方式重试..."
+            fi
+            run_git_with_token_auth "$REPO_URL" "rm -rf '$TARGET_DIR' && git clone --branch '$BRANCH' '$REPO_URL' '$TARGET_DIR'" || fail "仓库克隆失败，请检查仓库地址、分支或访问权限。"
+        else
+            fail "仓库克隆失败，请检查仓库地址、分支或访问权限。"
+        fi
+    fi
 }
 
 start_project_now() {
@@ -319,6 +490,7 @@ main() {
             ;;
     esac
 
+    try_install_github_cli
     clone_or_update_repo
     start_project_now
 
