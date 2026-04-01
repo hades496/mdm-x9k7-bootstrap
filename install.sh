@@ -443,12 +443,8 @@ start_project_now() {
 }
 
 configure_macos_autostart() {
-    local launch_agents_dir plist_path
-    launch_agents_dir="${TARGET_HOME}/Library/LaunchAgents"
-    plist_path="${launch_agents_dir}/com.hades496.mediadownloadmanager.plist"
-
-    run_as_target_shell "mkdir -p '$launch_agents_dir' '$TARGET_DIR/logs'"
-    cat <<EOF | run_as_target_shell "cat > '$plist_path'"
+    run_as_target_shell "mkdir -p '${TARGET_HOME}/Library/LaunchAgents' '$TARGET_DIR/logs'"
+    cat <<EOF | run_as_target_shell "cat > '${TARGET_HOME}/Library/LaunchAgents/com.hades496.mediadownloadmanager.plist'"
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
@@ -482,10 +478,10 @@ configure_macos_autostart() {
 EOF
 
     if command_exists launchctl; then
-        run_as_target_shell "launchctl unload '$plist_path' >/dev/null 2>&1 || true"
+        run_as_target_shell "launchctl unload '${TARGET_HOME}/Library/LaunchAgents/com.hades496.mediadownloadmanager.plist' >/dev/null 2>&1 || true"
     fi
 
-    log "已写入 macOS 自启动配置: $plist_path（将在下次登录时自动启动）"
+    log "已写入 macOS 自启动配置: ${TARGET_HOME}/Library/LaunchAgents/com.hades496.mediadownloadmanager.plist（将在下次登录时自动启动）"
 }
 
 configure_linux_autostart() {
