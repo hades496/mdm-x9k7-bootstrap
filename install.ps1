@@ -7,6 +7,7 @@ param(
 )
 
 $ErrorActionPreference = 'Stop'
+$script:StartedWebUrl = 'http://127.0.0.1:8080'
 
 function Write-Info($Message) {
     Write-Host "[MDM installer] $Message"
@@ -31,6 +32,46 @@ function Test-IsInteractiveSession {
     }
     catch {
         return $true
+    }
+}
+
+function Resolve-ProjectPort {
+    $configPath = Join-Path $TargetDir 'data\config.json'
+    if (-not (Test-Path $configPath)) {
+        return 8080
+    }
+
+    try {
+        $config = Get-Content -Path $configPath -Raw -Encoding UTF8 | ConvertFrom-Json
+        $port = [int]$config.port
+        if ($port -lt 1 -or $port -gt 65535) {
+            return 8080
+        }
+        return $port
+    }
+    catch {
+        return 8080
+    }
+}
+
+function Open-ProjectWebPageIfPossible {
+    param([string]$Url)
+
+    if ([string]::IsNullOrWhiteSpace($Url)) {
+        return
+    }
+    if ($env:MDM_NO_BROWSER -or $env:MDM_NONINTERACTIVE) {
+        return
+    }
+    if (-not (Test-IsInteractiveSession)) {
+        return
+    }
+
+    try {
+        Start-Process $Url | Out-Null
+    }
+    catch {
+        Write-Warn "自动打开浏览器失败：$($_.Exception.Message)"
     }
 }
 
@@ -414,7 +455,24 @@ function Clone-Or-UpdateRepo {
     }
 
     if ((Test-Path $TargetDir) -and ((Get-ChildItem -Force -Path $TargetDir | Measure-Object).Count -gt 0)) {
-        throw "目标目录已存在且非空: $TargetDir"
+        if ($ForceReset) {
+            Write-Warn "目标目录 '$TargetDir' 已存在且非空（非 Git 仓库），因 -ForceReset 已启用，将清空后重新 clone..."
+            Remove-Item -Recurse -Force $TargetDir -ErrorAction Stop
+        }
+        elseif (Test-IsInteractiveSession) {
+            Write-Warn "目标目录 '$TargetDir' 已存在且非空（非 Git 仓库）。"
+            $confirm = Read-Host '[MDM installer] 是否清空该目录并重新 clone？[y/N]'
+            if ($confirm -match '^[yY]') {
+                Write-Info '正在清空目标目录...'
+                Remove-Item -Recurse -Force $TargetDir -ErrorAction Stop
+            }
+            else {
+                throw "用户取消操作。如需强制覆盖，请使用 -ForceReset 参数重新运行。"
+            }
+        }
+        else {
+            throw "目标目录 '$TargetDir' 已存在且非空（非 Git 仓库），无法自动 clone。请手动删除该目录或使用 -ForceReset 参数重新运行。"
+        }
     }
 
     if (Test-Path $TargetDir) {
@@ -451,6 +509,10 @@ function Start-ProjectNow {
     Write-Info '开始启动项目...'
     $command = "cd /d \"$TargetDir\" && set MDM_NONINTERACTIVE=1 && set MDM_NO_BROWSER=1 && call start.bat"
     Start-Process -FilePath 'cmd.exe' -ArgumentList '/c', $command -Wait -NoNewWindow
+
+    $port = Resolve-ProjectPort
+    $script:StartedWebUrl = "http://127.0.0.1:$port"
+    Open-ProjectWebPageIfPossible -Url $script:StartedWebUrl
 }
 
 function Configure-Autostart {
@@ -477,7 +539,7 @@ function Show-Summary {
     Write-Host "安装目录: $TargetDir"
     Write-Host '立即启动: 已执行'
     Write-Host ("开机自启: " + ($(if ($SkipAutostart) { '已跳过' } else { '已配置（登录后自动启动）' })))
-    Write-Host '访问地址: http://127.0.0.1:8080'
+    Write-Host ("访问地址: " + $script:StartedWebUrl)
     Write-Host ("停止服务: cd /d `"$TargetDir`" && stop.bat")
     Write-Host '====================================='
 }

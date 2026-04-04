@@ -10,6 +10,7 @@ TARGET_USER="${SUDO_USER:-$(id -un)}"
 TARGET_HOME="$(eval echo "~${TARGET_USER}")"
 TARGET_DIR_DEFAULT="${TARGET_HOME}/MediaDownloadManager"
 TARGET_DIR="${MDM_INSTALL_DIR:-$TARGET_DIR_DEFAULT}"
+STARTED_WEB_URL="http://127.0.0.1:8080"
 
 log() {
     echo "[MDM installer] $*"
@@ -155,6 +156,49 @@ has_interactive_tty() {
     exec 3>&-
     exec 3<&-
     return 0
+}
+
+resolve_project_port() {
+    local port_output="8080"
+
+    if run_as_target_shell "[ -f '$TARGET_DIR/data/config.json' ]"; then
+        port_output="$(run_as_target_shell "grep -E '\"port\"[[:space:]]*:' '$TARGET_DIR/data/config.json' 2>/dev/null | sed -E 's/.*\"port\"[[:space:]]*:[[:space:]]*([0-9]+).*/\\1/' | head -n 1" || true)"
+    fi
+
+    port_output="$(printf '%s' "$port_output" | tr -d '[:space:]')"
+    case "$port_output" in
+        ''|*[!0-9]*)
+            port_output="8080"
+            ;;
+    esac
+
+    if [ "$port_output" -lt 1 ] || [ "$port_output" -gt 65535 ] 2>/dev/null; then
+        port_output="8080"
+    fi
+
+    printf '%s\n' "$port_output"
+}
+
+maybe_open_project_web() {
+    local url="$1"
+    [ -n "$url" ] || return 0
+
+    if [ -n "${MDM_NO_BROWSER:-}" ] || [ -n "${MDM_NONINTERACTIVE:-}" ]; then
+        return 0
+    fi
+
+    if ! has_interactive_tty; then
+        return 0
+    fi
+
+    case "$(uname -s)" in
+        Darwin)
+            run_as_target_shell "command -v open >/dev/null 2>&1 && open '$url' >/dev/null 2>&1 || true"
+            ;;
+        Linux)
+            run_as_target_shell "command -v xdg-open >/dev/null 2>&1 && xdg-open '$url' >/dev/null 2>&1 || true"
+            ;;
+    esac
 }
 
 run_as_target_shell_interactive() {
@@ -452,7 +496,24 @@ clone_or_update_repo() {
     fi
 
     if run_as_target_shell "[ -e '$TARGET_DIR' ] && [ -n \"\$(ls -A '$TARGET_DIR' 2>/dev/null)\" ]"; then
-        fail "目标目录 '$TARGET_DIR' 已存在且非空，无法自动 clone。"
+        if [ "$FORCE_RESET" = "1" ]; then
+            warn "目标目录 '$TARGET_DIR' 已存在且非空（非 Git 仓库），因 --force-reset 已启用，将清空后重新 clone..."
+            run_as_target_shell "rm -rf '$TARGET_DIR'" || fail "清空目标目录失败，请手动删除 '$TARGET_DIR' 后重试。"
+        elif has_interactive_tty; then
+            warn "目标目录 '$TARGET_DIR' 已存在且非空（非 Git 仓库）。"
+            read -r -p "[MDM installer] 是否清空该目录并重新 clone？[y/N] " confirm </dev/tty
+            case "$confirm" in
+                [yY]|[yY][eE][sS])
+                    log "正在清空目标目录..."
+                    run_as_target_shell "rm -rf '$TARGET_DIR'" || fail "清空目标目录失败，请手动删除 '$TARGET_DIR' 后重试。"
+                    ;;
+                *)
+                    fail "用户取消操作。如需强制覆盖，请使用 --force-reset 参数重新运行。"
+                    ;;
+            esac
+        else
+            fail "目标目录 '$TARGET_DIR' 已存在且非空（非 Git 仓库），无法自动 clone。请手动删除该目录或使用 --force-reset 参数重新运行。"
+        fi
     fi
 
     auth_ready=0
@@ -474,8 +535,14 @@ clone_or_update_repo() {
 }
 
 start_project_now() {
+    local port=""
+
     log "开始启动项目..."
     run_as_target_shell "cd '$TARGET_DIR' && export MDM_NONINTERACTIVE=1 MDM_NO_BROWSER=1 && bash start.sh"
+
+    port="$(resolve_project_port)"
+    STARTED_WEB_URL="http://127.0.0.1:${port}"
+    maybe_open_project_web "$STARTED_WEB_URL"
 }
 
 configure_macos_autostart() {
@@ -571,7 +638,7 @@ MediaDownloadManager 一键安装完成
 安装目录: ${TARGET_DIR}
 立即启动: 已执行
 开机自启: $( [ "$SKIP_AUTOSTART" = "1" ] && echo "已跳过" || echo "已配置" )
-访问地址: http://127.0.0.1:8080
+访问地址: ${STARTED_WEB_URL}
 停止服务: cd ${TARGET_DIR} && bash stop.sh
 =====================================
 EOF
